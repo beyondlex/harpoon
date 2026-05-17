@@ -14,7 +14,18 @@ Copy of the original [harpoon](https://github.com/ThePrimeagen/harpoon) for nvim
 - `Up` and `Down` or `j` and `k` to cycle through pane list
 - `d` to remove pane from list
 - `Enter` or `l` to switch to the selected pane
+- `/` to enter search mode
 - `Esc` or `Ctrl + c` to exit
+
+### Fuzzy Search
+
+Press `/` to enter search mode. Type characters to fuzzy-match against pane tab names and titles (characters must appear in order but not necessarily contiguous). Matched characters are highlighted in the list.
+
+In search mode:
+- `Up` / `Down` to navigate filtered results
+- `Enter` to jump to the selected pane
+- `Backspace` to delete characters (exits search mode when empty)
+- `Esc` to cancel search and return to normal mode
 
 ## Why?
 
