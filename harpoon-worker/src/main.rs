@@ -6,7 +6,7 @@ use zellij_tile::prelude::*;
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -33,6 +33,7 @@ struct State {
     session_name: Option<String>,
     last_focused_id: Option<u32>,
     timestamps: TimestampMap,
+    debug: bool,
 }
 
 impl State {
@@ -42,6 +43,29 @@ impl State {
 
     fn timestamps_file(session_name: &str) -> String {
         format!("{}/{}-timestamps.json", Self::data_dir(), session_name)
+    }
+
+    fn log_file(session_name: &str) -> String {
+        format!("{}/{}-debug.log", Self::data_dir(), session_name)
+    }
+
+    fn debug_log(&self, msg: &str) {
+        if !self.debug {
+            return;
+        }
+        let Some(session) = &self.session_name else { return };
+        let log_path = Self::log_file(session);
+        let ts = now_secs();
+        let line = format!("[{}] {}", ts, msg);
+        let cmd = format!(
+            "mkdir -p {} && echo '{}' >> {}",
+            Self::data_dir(),
+            line,
+            log_path,
+        );
+        let mut ctx = BTreeMap::new();
+        ctx.insert("source".to_string(), "log".to_string());
+        run_command(&["sh", "-c", &cmd], ctx);
     }
 
     fn save_timestamps(&self) {
@@ -95,12 +119,21 @@ impl State {
         let pane_id = focused_pane.id;
         let ts = now_secs();
 
-        // Update or insert, matching by pane_id first
-        if let Some(entry) = self.timestamps.entries.iter_mut().find(|e| e.pane_id == pane_id) {
+        self.debug_log(&format!(
+            "focus changed: pane_id={} tab=\"{}\" title=\"{}\" ts={}",
+            pane_id, tab_name, pane_title, ts
+        ));
+
+        // Update or insert, matching by pane_id first (skip legacy entries with pane_id=0)
+        if let Some(entry) = self.timestamps.entries.iter_mut().find(|e| e.pane_id != 0 && e.pane_id == pane_id) {
             entry.last_accessed = ts;
             entry.tab_name = tab_name.clone();
             entry.pane_title = pane_title.clone();
         } else {
+            // Remove stale legacy entry with same tab_name+pane_title
+            self.timestamps.entries.retain(|e| {
+                !(e.pane_id == 0 && e.tab_name == *tab_name && e.pane_title == *pane_title)
+            });
             self.timestamps.entries.push(TimestampEntry {
                 tab_name: tab_name.clone(),
                 pane_title: pane_title.clone(),
@@ -116,7 +149,11 @@ impl State {
 register_plugin!(State);
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.debug = configuration
+            .get("debug")
+            .map(|v| v == "true")
+            .unwrap_or(false);
         request_permission(&[
             PermissionType::RunCommands,
             PermissionType::ReadApplicationState,
