@@ -4,8 +4,16 @@ use core::fmt;
 use persistence::Persistence;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use zellij_tile::prelude::*;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// A tracked pane, combining zellij's PaneInfo with its parent TabInfo.
 ///
@@ -19,6 +27,8 @@ use zellij_tile::prelude::*;
 pub struct Pane {
     pub pane_info: PaneInfo,
     pub tab_info: TabInfo,
+    #[serde(default)]
+    pub last_accessed: u64,
 }
 
 impl fmt::Display for Pane {
@@ -88,6 +98,7 @@ fn get_valid_panes(
                     new_panes.push(Pane {
                         pane_info: pane_info.clone(),
                         tab_info: tab_info.clone(),
+                        last_accessed: pane.last_accessed,
                     });
                     break;
                 }
@@ -95,6 +106,20 @@ fn get_valid_panes(
         }
     }
     new_panes
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct TimestampMap {
+    entries: Vec<TimestampEntry>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TimestampEntry {
+    tab_name: String,
+    pane_title: String,
+    #[serde(default)]
+    pane_id: u32,
+    last_accessed: u64,
 }
 
 #[derive(Default)]
@@ -106,37 +131,88 @@ struct State {
     pane_manifest: Option<PaneManifest>,
     session_name: Option<String>,
     persistence: Persistence,
+    recent_sort: bool,
+    worker_timestamps: TimestampMap,
+    timestamps_loaded: bool,
 }
 
 impl State {
+
+    fn timestamps_file_path(session_name: &str) -> String {
+        format!("${{XDG_DATA_HOME:-$HOME/.local/share}}/zellij-harpoon/{}-timestamps.json", session_name)
+    }
+
+    fn load_worker_timestamps(&self) {
+        let Some(session) = &self.session_name else { return };
+        let file_path = Self::timestamps_file_path(session);
+        let cmd = format!("cat {} 2>/dev/null || echo '{{\"entries\":[]}}'", file_path);
+        let mut ctx = BTreeMap::new();
+        ctx.insert("source".to_string(), "timestamps".to_string());
+        run_command(&["sh", "-c", &cmd], ctx);
+    }
+
+    /// Returns indices into self.panes that should be displayed.
+    fn display_indices(&self) -> Vec<usize> {
+        self.panes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                if !self.recent_sort {
+                    return true;
+                }
+                self.focused_pane
+                    .as_ref()
+                    .map(|f| f.pane_info.id != p.pane_info.id)
+                    .unwrap_or(true)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn display_len(&self) -> usize {
+        self.display_indices().len()
+    }
+
     fn clamp_selected(&mut self) {
-        if self.panes.is_empty() {
+        let len = self.display_len();
+        if len == 0 {
             self.selected = 0;
-        } else if self.selected >= self.panes.len() {
-            self.selected = self.panes.len() - 1;
+        } else if self.selected >= len {
+            self.selected = len - 1;
         }
     }
 
     fn select_down(&mut self) {
-        if self.panes.is_empty() {
+        let len = self.display_len();
+        if len == 0 {
             return;
         }
-        self.selected = (self.selected + 1) % self.panes.len();
+        self.selected = (self.selected + 1) % len;
     }
 
     fn select_up(&mut self) {
-        if self.panes.is_empty() {
+        let len = self.display_len();
+        if len == 0 {
             return;
         }
         if self.selected == 0 {
-            self.selected = self.panes.len() - 1;
+            self.selected = len - 1;
             return;
         }
         self.selected -= 1;
     }
 
+    /// Maps the display-list selected index to the actual index in self.panes.
+    fn selected_pane_index(&self) -> Option<usize> {
+        self.display_indices().get(self.selected).copied()
+    }
+
     fn sort_panes(&mut self) {
-        self.panes.sort_by(|x, y| x.tab_info.position.cmp(&y.tab_info.position));
+        if self.recent_sort {
+            self.panes.sort_by(|x, y| y.last_accessed.cmp(&x.last_accessed));
+        } else {
+            self.panes.sort_by(|x, y| x.tab_info.position.cmp(&y.tab_info.position));
+        }
     }
 
     /// Reconciles the stored pane list against the latest manifest and updates
@@ -162,13 +238,58 @@ impl State {
         let focused_pane_info = get_focused_pane(focused_tab.position, &pane_manifest)?;
         self.focused_pane = Some(Pane {
             pane_info: focused_pane_info,
-            tab_info: focused_tab,
+            tab_info: focused_tab.clone(),
+            last_accessed: 0,
         });
 
-        // Move cursor to the focused pane if it's in the list
-        if let Some(focused) = &self.focused_pane {
-            if let Some(idx) = self.panes.iter().position(|p| p.pane_info.id == focused.pane_info.id) {
-                self.selected = idx;
+        // In recent_sort mode, merge worker timestamps into panes and auto-add all panes
+        if self.recent_sort && self.timestamps_loaded {
+            // Auto-add all terminal panes from manifest
+            let current_ids: Vec<u32> = self.panes.iter().map(|p| p.pane_info.id).collect();
+            for (tab_position, manifest_panes) in &pane_manifest.panes {
+                if let Some(tab) = tab_info.iter().find(|t| t.position == *tab_position) {
+                    for pane in manifest_panes {
+                        if !pane.is_plugin && !current_ids.contains(&pane.id) {
+                            let ts = self.worker_timestamps.entries.iter()
+                                .find(|e| e.pane_id == pane.id || (e.tab_name == tab.name && e.pane_title == pane.title))
+                                .map(|e| e.last_accessed)
+                                .unwrap_or(0);
+                            if ts > 0 {
+                                self.panes.push(Pane {
+                                    pane_info: pane.clone(),
+                                    tab_info: tab.clone(),
+                                    last_accessed: ts,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Update timestamps for existing panes from worker data
+            for pane in self.panes.iter_mut() {
+                let ts = self.worker_timestamps.entries.iter()
+                    .find(|e| e.pane_id == pane.pane_info.id || (e.tab_name == pane.tab_info.name && e.pane_title == pane.pane_info.title))
+                    .map(|e| e.last_accessed)
+                    .unwrap_or(0);
+                if ts > pane.last_accessed {
+                    pane.last_accessed = ts;
+                }
+            }
+            self.sort_panes();
+        }
+
+        // In recent_sort mode, always start at 0 (most recent, excluding focused).
+        // Otherwise, move cursor to the focused pane if it's in the list.
+        if self.recent_sort {
+            self.selected = 0;
+        } else {
+            if let Some(focused) = &self.focused_pane {
+                let display = self.display_indices();
+                if let Some(display_idx) = display.iter().position(|&i| {
+                    self.panes[i].pane_info.id == focused.pane_info.id
+                }) {
+                    self.selected = display_idx;
+                }
             }
         }
         self.clamp_selected();
@@ -185,7 +306,11 @@ impl State {
 register_plugin!(State);
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.recent_sort = configuration
+            .get("recent_sort")
+            .map(|v| v == "true")
+            .unwrap_or(false);
         request_permission(&[
             PermissionType::RunCommands,
             PermissionType::ReadApplicationState,
@@ -206,11 +331,17 @@ impl ZellijPlugin for State {
         match event {
             Event::TabUpdate(tab_info) => {
                 self.tab_info = Some(tab_info);
+                if self.recent_sort && self.session_name.is_some() {
+                    self.load_worker_timestamps();
+                }
                 self.update_panes();
                 should_render = true;
             }
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = Some(pane_manifest);
+                if self.recent_sort && self.session_name.is_some() {
+                    self.load_worker_timestamps();
+                }
                 self.update_panes();
                 should_render = true;
             }
@@ -225,11 +356,15 @@ impl ZellijPlugin for State {
                     if let Some(current) = session_infos.iter().find(|s| s.is_current_session) {
                         self.session_name = Some(current.name.clone());
                         self.persistence.load_from_disk(&self.session_name);
+                        if self.recent_sort {
+                            self.load_worker_timestamps();
+                        }
                     }
                 }
             }
             Event::RunCommandResult(_exit_code, stdout, _stderr, context) => {
-                if context.get("source").map(|s| s.as_str()) == Some("load") {
+                let source = context.get("source").map(|s| s.as_str());
+                if source == Some("load") {
                     let content = String::from_utf8_lossy(&stdout);
                     match self.persistence.on_load_command(&content) {
                         Ok(_) => {
@@ -240,6 +375,14 @@ impl ZellijPlugin for State {
                             eprintln!("{e}");
                         }
                     }
+                } else if source == Some("timestamps") {
+                    let content = String::from_utf8_lossy(&stdout);
+                    if let Ok(map) = serde_json::from_str::<TimestampMap>(&content) {
+                        self.worker_timestamps = map;
+                    }
+                    self.timestamps_loaded = true;
+                    self.update_panes();
+                    should_render = true;
                 }
             }
             Event::Key(key) => match key.bare_key {
@@ -255,6 +398,7 @@ impl ZellijPlugin for State {
                                             self.panes.push(Pane {
                                                 pane_info: pane.clone(),
                                                 tab_info: tab.clone(),
+                                                last_accessed: 0,
                                             });
                                         }
                                     }
@@ -274,7 +418,9 @@ impl ZellijPlugin for State {
                     // need to check the ID (not tab position).
                     if let Some(pane) = &self.focused_pane {
                         if !self.panes.iter().any(|p| p.pane_info.id == pane.pane_info.id) {
-                            self.panes.push(pane.clone());
+                            let mut new_pane = pane.clone();
+                            new_pane.last_accessed = now_secs();
+                            self.panes.push(new_pane);
                             self.sort_panes();
                             self.persistence
                                 .save_to_disk(&self.session_name, &self.panes);
@@ -284,8 +430,8 @@ impl ZellijPlugin for State {
                     hide_self();
                 }
                 BareKey::Char('d') => {
-                    if self.selected < self.panes.len() {
-                        self.panes.remove(self.selected);
+                    if let Some(idx) = self.selected_pane_index() {
+                        self.panes.remove(idx);
                         self.persistence
                             .save_to_disk(&self.session_name, &self.panes);
                     }
@@ -296,22 +442,25 @@ impl ZellijPlugin for State {
                     hide_self();
                 }
                 BareKey::Down | BareKey::Char('j') => {
-                    if self.panes.len() > 0 {
+                    if self.display_len() > 0 {
                         self.select_down();
                         should_render = true;
                     }
                 }
                 BareKey::Up | BareKey::Char('k') => {
-                    if self.panes.len() > 0 {
+                    if self.display_len() > 0 {
                         self.select_up();
                         should_render = true;
                     }
                 }
                 BareKey::Enter | BareKey::Char('l') => {
-                    if let Some(pane) = self.panes.get(self.selected) {
+                    if let Some(idx) = self.selected_pane_index() {
+                        self.panes[idx].last_accessed = now_secs();
+                        let pane_id = self.panes[idx].pane_info.id;
+                        self.persistence
+                            .save_to_disk(&self.session_name, &self.panes);
                         hide_self();
-                        // TODO: This has a bug on macOS with hidden panes
-                        focus_terminal_pane(pane.pane_info.id, true);
+                        focus_terminal_pane(pane_id, true);
                     }
                 }
                 _ => (),
@@ -325,13 +474,16 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         // Note: y=0 overlaps with the zellij pane frame/title bar and is not visible,
         // so we start rendering from y=1.
-        let header = format!("==== {} panes ====", self.panes.len());
+        let display = self.display_indices();
+
+        let header = format!("==== {} panes ====", display.len());
         let x = cols.saturating_sub(header.len()) / 2;
         print_text_with_coordinates(Text::new(&header), x, 0, None, None);
         let mut y = 1;
 
-        for (idx, pane) in self.panes.iter().enumerate() {
-            let text = if idx == self.selected {
+        for (display_idx, &pane_idx) in display.iter().enumerate() {
+            let pane = &self.panes[pane_idx];
+            let text = if display_idx == self.selected {
                 Text::new(&pane.to_string()).selected()
             } else {
                 Text::new(&pane.to_string())

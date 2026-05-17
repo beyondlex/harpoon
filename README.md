@@ -37,7 +37,8 @@ git clone git@github.com:Nacho114/harpoon.git
 cd harpoon
 cargo build --release
 mkdir -p ~/.config/zellij/plugins/
-mv target/wasm32-wasip1/release/harpoon.wasm ~/.config/zellij/plugins/
+cp target/wasm32-wasip1/release/harpoon.wasm ~/.config/zellij/plugins/
+cp target/wasm32-wasip1/release/harpoon-worker.wasm ~/.config/zellij/plugins/
 ```
 
 ## Keybinding
@@ -56,6 +57,40 @@ shared_except "locked" {
 ```
 
 > You likely already have a `shared_except "locked"` section in your configs. Feel free to add `bind` there.
+
+## Recent Sort Mode
+
+Enable `recent_sort` to sort the pane list by last accessed time (like JetBrains' Recent Files). The current focused pane is hidden from the list, so the first item is always your previous pane.
+
+```kdl
+shared_except "locked" {
+    bind "Ctrl y" {
+        LaunchOrFocusPlugin "file:~/.config/zellij/plugins/harpoon.wasm" {
+            floating true; move_to_focused_tab true;
+            recent_sort "true"
+        }
+    }
+}
+```
+
+This mode requires the **harpoon-worker** background plugin to track pane focus changes while harpoon is closed. Add it to your layout as a hidden pane:
+
+```kdl
+// In your layout file (e.g. ~/.config/zellij/layouts/default.kdl)
+pane size=1 borderless=true {
+    plugin location="file:~/.config/zellij/plugins/harpoon-worker.wasm"
+}
+```
+
+Or load it in your zellij config startup:
+
+```kdl
+load_plugins {
+    "file:~/.config/zellij/plugins/harpoon-worker.wasm"
+}
+```
+
+The worker continuously monitors which pane has focus and writes timestamps to `~/.local/share/zellij-harpoon/{session}-timestamps.json`. When harpoon opens, it reads this file to sort panes by recency.
 
 ## Contributing
 
