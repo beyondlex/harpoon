@@ -134,6 +134,8 @@ struct State {
     recent_sort: bool,
     worker_timestamps: TimestampMap,
     timestamps_loaded: bool,
+    search_query: String,
+    search_mode: bool,
 }
 
 impl State {
@@ -154,17 +156,25 @@ impl State {
 
     /// Returns indices into self.panes that should be displayed.
     fn display_indices(&self) -> Vec<usize> {
+        let query = self.search_query.to_lowercase();
         self.panes
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                if !self.recent_sort {
-                    return true;
+                if self.recent_sort {
+                    if let Some(f) = &self.focused_pane {
+                        if f.pane_info.id == p.pane_info.id {
+                            return false;
+                        }
+                    }
                 }
-                self.focused_pane
-                    .as_ref()
-                    .map(|f| f.pane_info.id != p.pane_info.id)
-                    .unwrap_or(true)
+                if !query.is_empty() {
+                    let haystack = format!("{} | {}", p.tab_info.name, p.pane_info.title).to_lowercase();
+                    if !fuzzy_match(&query, &haystack) {
+                        return false;
+                    }
+                }
+                true
             })
             .map(|(i, _)| i)
             .collect()
@@ -386,85 +396,137 @@ impl ZellijPlugin for State {
                     should_render = true;
                 }
             }
-            Event::Key(key) => match key.bare_key {
-                BareKey::Char('A') => {
-                    // Add all terminal panes from all tabs that aren't already tracked
-                    let current_ids: Vec<u32> = self.panes.iter().map(|p| p.pane_info.id).collect();
-                    if let Some(pane_manifest) = &self.pane_manifest {
-                        if let Some(tab_info) = &self.tab_info {
-                            for (tab_position, panes) in &pane_manifest.panes {
-                                if let Some(tab) = tab_info.iter().find(|t| t.position == *tab_position) {
-                                    for pane in panes {
-                                        if !pane.is_plugin && !current_ids.contains(&pane.id) {
-                                            self.panes.push(Pane {
-                                                pane_info: pane.clone(),
-                                                tab_info: tab.clone(),
-                                                last_accessed: 0,
-                                            });
+            Event::Key(key) => if self.search_mode {
+                match key.bare_key {
+                    BareKey::Esc => {
+                        self.search_mode = false;
+                        self.search_query.clear();
+                        self.selected = 0;
+                        self.clamp_selected();
+                        should_render = true;
+                    }
+                    BareKey::Backspace => {
+                        self.search_query.pop();
+                        if self.search_query.is_empty() {
+                            self.search_mode = false;
+                        }
+                        self.selected = 0;
+                        self.clamp_selected();
+                        should_render = true;
+                    }
+                    BareKey::Enter => {
+                        if let Some(idx) = self.selected_pane_index() {
+                            self.panes[idx].last_accessed = now_secs();
+                            let pane_id = self.panes[idx].pane_info.id;
+                            self.persistence
+                                .save_to_disk(&self.session_name, &self.panes);
+                            self.search_mode = false;
+                            self.search_query.clear();
+                            hide_self();
+                            focus_terminal_pane(pane_id, true);
+                        }
+                    }
+                    BareKey::Down => {
+                        if self.display_len() > 0 {
+                            self.select_down();
+                            should_render = true;
+                        }
+                    }
+                    BareKey::Up => {
+                        if self.display_len() > 0 {
+                            self.select_up();
+                            should_render = true;
+                        }
+                    }
+                    BareKey::Char(c) => {
+                        self.search_query.push(c);
+                        self.selected = 0;
+                        self.clamp_selected();
+                        should_render = true;
+                    }
+                    _ => (),
+                }
+            } else {
+                match key.bare_key {
+                    BareKey::Char('/') => {
+                        self.search_mode = true;
+                        should_render = true;
+                    }
+                    BareKey::Char('A') => {
+                        let current_ids: Vec<u32> = self.panes.iter().map(|p| p.pane_info.id).collect();
+                        if let Some(pane_manifest) = &self.pane_manifest {
+                            if let Some(tab_info) = &self.tab_info {
+                                for (tab_position, panes) in &pane_manifest.panes {
+                                    if let Some(tab) = tab_info.iter().find(|t| t.position == *tab_position) {
+                                        for pane in panes {
+                                            if !pane.is_plugin && !current_ids.contains(&pane.id) {
+                                                self.panes.push(Pane {
+                                                    pane_info: pane.clone(),
+                                                    tab_info: tab.clone(),
+                                                    last_accessed: 0,
+                                                });
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        self.sort_panes();
+                        self.persistence
+                            .save_to_disk(&self.session_name, &self.panes);
+                        should_render = true;
+                        hide_self();
                     }
-                    self.sort_panes();
-                    self.persistence
-                        .save_to_disk(&self.session_name, &self.panes);
-                    should_render = true;
-                    hide_self();
-                }
-                BareKey::Char('a') => {
-                    // Add the currently focused terminal pane if not already tracked.
-                    // Since pane IDs are session-unique for terminal panes, we only
-                    // need to check the ID (not tab position).
-                    if let Some(pane) = &self.focused_pane {
-                        if !self.panes.iter().any(|p| p.pane_info.id == pane.pane_info.id) {
-                            let mut new_pane = pane.clone();
-                            new_pane.last_accessed = now_secs();
-                            self.panes.push(new_pane);
-                            self.sort_panes();
+                    BareKey::Char('a') => {
+                        if let Some(pane) = &self.focused_pane {
+                            if !self.panes.iter().any(|p| p.pane_info.id == pane.pane_info.id) {
+                                let mut new_pane = pane.clone();
+                                new_pane.last_accessed = now_secs();
+                                self.panes.push(new_pane);
+                                self.sort_panes();
+                                self.persistence
+                                    .save_to_disk(&self.session_name, &self.panes);
+                            }
+                        }
+                        should_render = true;
+                        hide_self();
+                    }
+                    BareKey::Char('d') => {
+                        if let Some(idx) = self.selected_pane_index() {
+                            self.panes.remove(idx);
                             self.persistence
                                 .save_to_disk(&self.session_name, &self.panes);
                         }
-                    }
-                    should_render = true;
-                    hide_self();
-                }
-                BareKey::Char('d') => {
-                    if let Some(idx) = self.selected_pane_index() {
-                        self.panes.remove(idx);
-                        self.persistence
-                            .save_to_disk(&self.session_name, &self.panes);
-                    }
-                    self.clamp_selected();
-                    should_render = true;
-                }
-                BareKey::Char('c') | BareKey::Esc => {
-                    hide_self();
-                }
-                BareKey::Down | BareKey::Char('j') => {
-                    if self.display_len() > 0 {
-                        self.select_down();
+                        self.clamp_selected();
                         should_render = true;
                     }
-                }
-                BareKey::Up | BareKey::Char('k') => {
-                    if self.display_len() > 0 {
-                        self.select_up();
-                        should_render = true;
-                    }
-                }
-                BareKey::Enter | BareKey::Char('l') => {
-                    if let Some(idx) = self.selected_pane_index() {
-                        self.panes[idx].last_accessed = now_secs();
-                        let pane_id = self.panes[idx].pane_info.id;
-                        self.persistence
-                            .save_to_disk(&self.session_name, &self.panes);
+                    BareKey::Char('c') | BareKey::Esc => {
                         hide_self();
-                        focus_terminal_pane(pane_id, true);
                     }
+                    BareKey::Down | BareKey::Char('j') => {
+                        if self.display_len() > 0 {
+                            self.select_down();
+                            should_render = true;
+                        }
+                    }
+                    BareKey::Up | BareKey::Char('k') => {
+                        if self.display_len() > 0 {
+                            self.select_up();
+                            should_render = true;
+                        }
+                    }
+                    BareKey::Enter | BareKey::Char('l') => {
+                        if let Some(idx) = self.selected_pane_index() {
+                            self.panes[idx].last_accessed = now_secs();
+                            let pane_id = self.panes[idx].pane_info.id;
+                            self.persistence
+                                .save_to_disk(&self.session_name, &self.panes);
+                            hide_self();
+                            focus_terminal_pane(pane_id, true);
+                        }
+                    }
+                    _ => (),
                 }
-                _ => (),
             },
             _ => (),
         };
@@ -473,22 +535,32 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        // Note: y=0 overlaps with the zellij pane frame/title bar and is not visible,
-        // so we start rendering from y=1.
         let display = self.display_indices();
+        let mut y = 0;
 
-        let header = format!("==== {} panes ====", display.len());
-        let x = cols.saturating_sub(header.len()) / 2;
-        print_text_with_coordinates(Text::new(&header), x, 0, None, None);
-        let mut y = 1;
+        if self.search_mode {
+            let search_line = format!("/{}", self.search_query);
+            print_text_with_coordinates(Text::new(&search_line), 0, y, None, None);
+        } else {
+            let header = format!("==== {} panes ====", display.len());
+            let x = cols.saturating_sub(header.len()) / 2;
+            print_text_with_coordinates(Text::new(&header), x, y, None, None);
+        }
+        y += 1;
 
         for (display_idx, &pane_idx) in display.iter().enumerate() {
             let pane = &self.panes[pane_idx];
-            let text = if display_idx == self.selected {
-                Text::new(&pane.to_string()).selected()
+            let pane_str = pane.to_string();
+            let mut text = if display_idx == self.selected {
+                Text::new(&pane_str).selected()
             } else {
-                Text::new(&pane.to_string())
+                Text::new(&pane_str)
             };
+            if self.search_mode && !self.search_query.is_empty() {
+                for range in fuzzy_match_indices(&self.search_query, &pane_str) {
+                    text = text.color_range(3, range);
+                }
+            }
             print_text_with_coordinates(text, 0, y, None, None);
             y += 1;
         }
@@ -497,6 +569,34 @@ impl ZellijPlugin for State {
         let hint_line = build_hint_line(cols);
         print_text_with_coordinates(hint_line, 0, hint_y, None, None);
     }
+}
+
+/// Fuzzy match: all characters in needle must appear in haystack in order.
+fn fuzzy_match(needle: &str, haystack: &str) -> bool {
+    let mut haystack_chars = haystack.chars();
+    for nc in needle.chars() {
+        if haystack_chars.find(|&hc| hc == nc).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns byte-offset ranges of matched characters for highlighting.
+fn fuzzy_match_indices(needle: &str, haystack: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let needle_lower = needle.to_lowercase();
+    let haystack_lower = haystack.to_lowercase();
+    let mut h_iter = haystack_lower.char_indices().peekable();
+    for nc in needle_lower.chars() {
+        while let Some((byte_pos, hc)) = h_iter.next() {
+            if hc == nc {
+                ranges.push(byte_pos..byte_pos + hc.len_utf8());
+                break;
+            }
+        }
+    }
+    ranges
 }
 
 fn build_hint_line(cols: usize) -> Text {
