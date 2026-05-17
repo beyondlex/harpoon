@@ -142,8 +142,9 @@ impl State {
         format!("${{XDG_DATA_HOME:-$HOME/.local/share}}/zellij-harpoon/{}-timestamps.json", session_name)
     }
 
-    fn load_worker_timestamps(&self) {
+    fn load_worker_timestamps(&mut self) {
         let Some(session) = &self.session_name else { return };
+        self.timestamps_loaded = false;
         let file_path = Self::timestamps_file_path(session);
         let cmd = format!("cat {} 2>/dev/null || echo '{{\"entries\":[]}}'", file_path);
         let mut ctx = BTreeMap::new();
