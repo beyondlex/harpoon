@@ -262,7 +262,8 @@ impl State {
                     for pane in manifest_panes {
                         if !pane.is_plugin && !current_ids.contains(&pane.id) {
                             let ts = self.worker_timestamps.entries.iter()
-                                .find(|e| e.pane_id == pane.id || (e.tab_name == tab.name && e.pane_title == pane.title))
+                                .find(|e| e.pane_id == pane.id)
+                                .or_else(|| self.worker_timestamps.entries.iter().find(|e| e.pane_id == 0 && e.tab_name == tab.name && e.pane_title == pane.title))
                                 .map(|e| e.last_accessed)
                                 .unwrap_or(0);
                             if ts > 0 {
@@ -279,7 +280,8 @@ impl State {
             // Update timestamps for existing panes from worker data
             for pane in self.panes.iter_mut() {
                 let ts = self.worker_timestamps.entries.iter()
-                    .find(|e| e.pane_id == pane.pane_info.id || (e.tab_name == pane.tab_info.name && e.pane_title == pane.pane_info.title))
+                    .find(|e| e.pane_id == pane.pane_info.id)
+                    .or_else(|| self.worker_timestamps.entries.iter().find(|e| e.pane_id == 0 && e.tab_name == pane.tab_info.name && e.pane_title == pane.pane_info.title))
                     .map(|e| e.last_accessed)
                     .unwrap_or(0);
                 if ts > pane.last_accessed {
